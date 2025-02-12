@@ -102,7 +102,12 @@ class DDIMSolver:
         x_prev = alpha_cumprod_prev.sqrt() * pred_x0 + dir_xt
         return x_prev
 
-
+validation_prompts = [
+    "cute sundar pichai character",
+    "robotic cat with wings",
+    "a photo of yoda",
+    "a cute creature with blue eyes",
+]
 def log_validation(vae, args, accelerator, weight_dtype, step, unet=None, is_final_validation=False):
     logger.info("Running validation... ")
 
@@ -135,14 +140,7 @@ def log_validation(vae, args, accelerator, weight_dtype, step, unet=None, is_fin
         generator = None
     else:
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
-
-    validation_prompts = [
-        "huangertao, go hiking",
-        "masterpiece, best quality,  huangertao, cute, is painting",
-        "huangertao, cute, open mouth, tongue, standing, backpack, outdoors",
-        "huangertao, cute, plump, drunk, in bar",
-    ]
-
+        
     image_logs = []
 
     for _, prompt in enumerate(validation_prompts):
@@ -319,7 +317,7 @@ def parse_args():
         default=None,
         help="The directory where the downloaded models and datasets will be stored.",
     )
-    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
+    parser.add_argument("--seed", type=int, default=42, help="A seed for reproducible training.")
     # ----Logging----
     parser.add_argument(
         "--logging_dir",
@@ -657,6 +655,25 @@ def parse_args():
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
+    
+    # ----------Additional-------------------
+    parser.add_argument(
+        "--no_shuffle_tags",
+        action="store_true",
+        help="disable shuffle tags in training."
+    )
+    parser.add_argument(
+        "--activation_tags",
+        type=int,
+        default=1,
+        help="keep first n tags order, do not shuffle them."
+    )
+    parser.add_argument(
+        "--validation_promptfile",
+        type=str,
+        default=None,
+        help="use to generate validation image into tensorboard"
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -737,6 +754,11 @@ def main(args):
     else:
         transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
+        
+    if args.validation_promptfile is not None:
+        global validation_prompts
+        with open(args.validation_promptfile, "r", encoding='utf-8') as f:
+            validation_prompts = [ x.strip() for x in f.readlines() if x.strip() != "" ]
 
     # If passed along, set the training seed now.
     if args.seed is not None:
@@ -1223,6 +1245,15 @@ def main(args):
                     batch["original_sizes"],
                     batch["crop_top_lefts"],
                 )
+                
+                if not args.no_shuffle_tags:
+                    for i in range(len(text)):
+                        tags = [ x.strip() for x in text[i].split(',') ]
+                        keep_tags = tags[:args.activation_tags]
+                        shuffle_tags = tags[args.activation_tags:]
+                        random.shuffle(shuffle_tags)
+                        keep_tags.extend(shuffle_tags)
+                        text[i] = ", ".join(keep_tags)
 
                 encoded_text = compute_embeddings_fn(text, orig_size, crop_coords)
 
