@@ -137,10 +137,10 @@ def log_validation(vae, args, accelerator, weight_dtype, step, unet=None, is_fin
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
     validation_prompts = [
-        "cute sundar pichai character",
-        "robotic cat with wings",
-        "a photo of yoda",
-        "a cute creature with blue eyes",
+        "huangertao, go hiking",
+        "masterpiece, best quality,  huangertao, cute, is painting",
+        "huangertao, cute, open mouth, tongue, standing, backpack, outdoors",
+        "huangertao, cute, plump, drunk, in bar",
     ]
 
     image_logs = []
