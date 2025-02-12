@@ -1,16 +1,12 @@
 # Safetensors转Diffusers
 
 ```bash
-python convert_original_stable_diffusion_to_diffusers.py --checkpoint_path dfdog/model/DragonfruitDogLoraMerge06_v1.safetensors --from_safetensors --dump_path dfdog/diffusers
+python convert_original_stable_diffusion_to_diffusers.py --checkpoint_path dfdog/model/DragonfruitDogLoraMerge06_v1.safetensors --from_safetensors --half --dump_path dfdog/diffusers
 ```
-
-
 
 # 读取生成图的metadata
 
 https://github.com/AUTOMATIC1111/stable-diffusion-webui/discussions/15323
-
-
 
 # 训练
 
