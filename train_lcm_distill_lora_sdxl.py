@@ -1385,7 +1385,7 @@ def main(args):
                     # 4. Run one step of the ODE solver to estimate the next point x_prev on the
                     # augmented PF-ODE trajectory (solving backward in time)
                     # Note that the DDIM step depends on both the predicted x_0 and source noise eps_0.
-                    x_prev = solver.ddim_step(pred_x0, pred_noise, index).to(unet.dtype)
+                    x_prev = solver.ddim_step(pred_x0, pred_noise, index).to(accelerator.unwrap_model(unet).dtype)
 
                 # re-enable unet adapters to turn the `unet` into a student unet.
                 accelerator.unwrap_model(unet).enable_adapters()
