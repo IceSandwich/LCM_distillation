@@ -1048,41 +1048,64 @@ def main(args):
     train_flip = transforms.RandomHorizontalFlip(p=1.0)
     train_transforms = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
 
-    vae.requires_grad(False)
+    # Cache latents to disk
+    vae.requires_grad_(False)
     vae.eval()
+    def convert_filename_to_npz_filename(filename: str):
+        return os.path.join(args.train_data_dir, os.path.splitext(filename)[0] + ".npz")
+    for data in tqdm(dataset["train"], "cache latents"):
+        filename = convert_filename_to_npz_filename(data["filename"])
+        image = data["image"]
+        original_size = (image.height, image.width)
+        image = train_resize(image)
+        if args.center_crop:
+            y1 = max(0, int(round((image.height - args.resolution) / 2.0)))
+            x1 = max(0, int(round((image.width - args.resolution) / 2.0)))
+            image = train_crop(image)
+        else:
+            y1, x1, h, w = train_crop.get_params(image, (args.resolution, args.resolution))
+            image = crop(image, y1, x1, h, w)
+        if args.random_flip and random.random() < 0.5:
+            # flip
+            x1 = image.width - x1
+            image = train_flip(image)
+        crop_top_left = (y1, x1)
+        image = train_transforms(image)
+
+        image = image.unsqueeze(0)
+        image = image.to(device=vae.device, dtype=vae.dtype)
+        with torch.no_grad():
+            latent = (vae.encode(image).latent_dist.sample() * vae.config.scaling_factor).to('cpu')
+
+        np.savez(
+            filename,
+            latent=latent.float().cpu().squeeze().numpy(),
+            original_size=np.array(original_size),
+            crop_top_left=np.array(crop_top_left)
+        )
+        
+    # free vae
+    vae.to('cpu')
+    del vae
+    clean_memory_on_device(accelerator.device)
+    accelerator.wait_for_everyone()
+
     def preprocess_train(examples):
-        images = [image.convert("RGB") for image in examples[image_column]]
-        # image aug
         original_sizes = []
-        all_images = []
         crop_top_lefts = []
         cache_latents = []
-        for image in images:
-            original_sizes.append((image.height, image.width))
-            image = train_resize(image)
-            if args.center_crop:
-                y1 = max(0, int(round((image.height - args.resolution) / 2.0)))
-                x1 = max(0, int(round((image.width - args.resolution) / 2.0)))
-                image = train_crop(image)
-            else:
-                y1, x1, h, w = train_crop.get_params(image, (args.resolution, args.resolution))
-                image = crop(image, y1, x1, h, w)
-            if args.random_flip and random.random() < 0.5:
-                # flip
-                x1 = image.width - x1
-                image = train_flip(image)
-            crop_top_left = (y1, x1)
-            crop_top_lefts.append(crop_top_left)
-            image = train_transforms(image)
-            all_images.append(image)
-            
-            image.to(dtype=vae.dtype)
-            with torch.no_grad():
-                cache_latents.append(vae.encode(image).latent_dist.sample() * vae.config.scaling_factor)
+
+        for example in examples["filename"]:
+            filename = convert_filename_to_npz_filename(example)
+            cache_info = np.load(filename)
+            original_size = cache_info["original_size"]
+            original_sizes.append((original_size[0], original_size[1]))
+            crop_top_left = cache_info["crop_top_left"]
+            crop_top_lefts.append((crop_top_left[0], crop_top_left[1]))
+            cache_latents.append(torch.asarray(cache_info["latent"]))
 
         examples["original_sizes"] = original_sizes
         examples["crop_top_lefts"] = crop_top_lefts
-        # examples["pixel_values"] = all_images
         examples["captions"] = list(examples[caption_column])
         examples["cache_latents"] = cache_latents
         return examples
@@ -1093,12 +1116,6 @@ def main(args):
         # Set the training transforms
         train_dataset = dataset["train"].with_transform(preprocess_train)
     
-    # free vae
-    vae.to('cpu')
-    del vae
-    clean_memory_on_device(accelerator.device)
-    accelerator.wait_for_everyone()
-
     def collate_fn(examples):
         # pixel_values = torch.stack([example["pixel_values"] for example in examples])
         # pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
