@@ -61,6 +61,9 @@ from diffusers.utils import (
 )
 from diffusers.utils.import_utils import is_xformers_available
 
+import sys
+sys.path.append("sdscripts")
+from sdscripts.library.device_utils import clean_memory_on_device
 
 if is_wandb_available():
     import wandb
@@ -1045,12 +1048,15 @@ def main(args):
     train_flip = transforms.RandomHorizontalFlip(p=1.0)
     train_transforms = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
 
+    vae.requires_grad(False)
+    vae.eval()
     def preprocess_train(examples):
         images = [image.convert("RGB") for image in examples[image_column]]
         # image aug
         original_sizes = []
         all_images = []
         crop_top_lefts = []
+        cache_latents = []
         for image in images:
             original_sizes.append((image.height, image.width))
             image = train_resize(image)
@@ -1069,11 +1075,16 @@ def main(args):
             crop_top_lefts.append(crop_top_left)
             image = train_transforms(image)
             all_images.append(image)
+            
+            image.to(dtype=vae.dtype)
+            with torch.no_grad():
+                cache_latents.append(vae.encode(image).latent_dist.sample() * vae.config.scaling_factor)
 
         examples["original_sizes"] = original_sizes
         examples["crop_top_lefts"] = crop_top_lefts
-        examples["pixel_values"] = all_images
+        # examples["pixel_values"] = all_images
         examples["captions"] = list(examples[caption_column])
+        examples["cache_latents"] = cache_latents
         return examples
 
     with accelerator.main_process_first():
@@ -1081,16 +1092,25 @@ def main(args):
             dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
         # Set the training transforms
         train_dataset = dataset["train"].with_transform(preprocess_train)
+    
+    # free vae
+    vae.to('cpu')
+    del vae
+    clean_memory_on_device(accelerator.device)
+    accelerator.wait_for_everyone()
 
     def collate_fn(examples):
-        pixel_values = torch.stack([example["pixel_values"] for example in examples])
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+        # pixel_values = torch.stack([example["pixel_values"] for example in examples])
+        # pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+        
+        cache_latents = torch.stack([example["cache_latents"] for example in examples])
         original_sizes = [example["original_sizes"] for example in examples]
         crop_top_lefts = [example["crop_top_lefts"] for example in examples]
         captions = [example["captions"] for example in examples]
 
         return {
-            "pixel_values": pixel_values,
+            # "pixel_values": pixel_values,
+            "cache_latents": cache_latents,
             "captions": captions,
             "original_sizes": original_sizes,
             "crop_top_lefts": crop_top_lefts,
@@ -1239,8 +1259,14 @@ def main(args):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
                 # 1. Load and process the image and text conditioning
-                pixel_values, text, orig_size, crop_coords = (
-                    batch["pixel_values"],
+                # pixel_values, text, orig_size, crop_coords = (
+                #     batch["pixel_values"],
+                #     batch["captions"],
+                #     batch["original_sizes"],
+                #     batch["crop_top_lefts"],
+                # )
+                latents, text, orig_size, crop_coords = (
+                    batch["cache_latents"],
                     batch["captions"],
                     batch["original_sizes"],
                     batch["crop_top_lefts"],
@@ -1258,13 +1284,13 @@ def main(args):
                 encoded_text = compute_embeddings_fn(text, orig_size, crop_coords)
 
                 # encode pixel values with batch size of at most args.vae_encode_batch_size
-                pixel_values = pixel_values.to(dtype=vae.dtype)
-                latents = []
-                for i in range(0, pixel_values.shape[0], args.vae_encode_batch_size):
-                    latents.append(vae.encode(pixel_values[i : i + args.vae_encode_batch_size]).latent_dist.sample())
-                latents = torch.cat(latents, dim=0)
+                # pixel_values = pixel_values.to(dtype=vae.dtype)
+                # latents = []
+                # for i in range(0, pixel_values.shape[0], args.vae_encode_batch_size):
+                #     latents.append(vae.encode(pixel_values[i : i + args.vae_encode_batch_size]).latent_dist.sample())
+                # latents = torch.cat(latents, dim=0)
 
-                latents = latents * vae.config.scaling_factor
+                # latents = latents * vae.config.scaling_factor
                 if args.pretrained_vae_model_name_or_path is None:
                     latents = latents.to(weight_dtype)
 
