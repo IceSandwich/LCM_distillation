@@ -534,7 +534,7 @@ def parse_args():
     parser.add_argument(
         "--tracker_project_name",
         type=str,
-        default="text2image-fine-tune-{timestamp}",
+        default="text2image-fine-tune",
         help=(
             "The `project_name` argument passed to Accelerator.init_trackers for"
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
@@ -842,9 +842,12 @@ def main(args):
     # 13. Dataset creation and data processing
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
-    if not os.path.exists(args.cache_dir):
-        os.makedirs(args.cache_dir)
-        print("Create cache dir: ", args.cache_dir)
+    if accelerator.is_main_process:
+        if not os.path.exists(args.cache_dir):
+            os.makedirs(args.cache_dir)
+            print("Create cache dir: ", args.cache_dir)
+    accelerator.wait_for_everyone()
+    
     if args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
         dataset = load_dataset(
@@ -860,7 +863,7 @@ def main(args):
                 "filename": [],
                 "text": [],
             }
-            for filename in [ x for x in os.listdir(folder) if x.endswith('.png') or x.endswith('jpg') ]:
+            for filename in [ x for x in os.listdir(folder) if x.endswith('.png') or x.endswith('.jpg') or x.endswith(".jpeg") ]:
                 image = Image.open(os.path.join(folder, filename)).convert("RGB")
                 if "parameters" in image.info:
                     parameters = image.info["parameters"].split("\n")
@@ -920,38 +923,40 @@ def main(args):
     # Cache latents to disk
     vae.requires_grad_(False)
     vae.eval()
-    def convert_filename_to_npz_filename(filename: str):
-        return os.path.join(args.cache_dir, os.path.splitext(filename)[0] + ".npz")
-    for data in tqdm(dataset["train"], "cache latents"):
-        filename = convert_filename_to_npz_filename(data["filename"])
-        image = data["image"]
-        original_size = (image.height, image.width)
-        image = train_resize(image)
-        if args.center_crop:
-            y1 = max(0, int(round((image.height - args.resolution) / 2.0)))
-            x1 = max(0, int(round((image.width - args.resolution) / 2.0)))
-            image = train_crop(image)
-        else:
-            y1, x1, h, w = train_crop.get_params(image, (args.resolution, args.resolution))
-            image = crop(image, y1, x1, h, w)
-        if args.random_flip and random.random() < 0.5:
-            # flip
-            x1 = image.width - x1
-            image = train_flip(image)
-        crop_top_left = (y1, x1)
-        image = train_transforms(image)
+    if accelerator.is_main_process:
+        def convert_filename_to_npz_filename(filename: str):
+            return os.path.join(args.cache_dir, os.path.splitext(filename)[0] + ".npz")
+        for data in tqdm(dataset["train"], "cache latents"):
+            filename = convert_filename_to_npz_filename(data["filename"])
+            image = data["image"]
+            original_size = (image.height, image.width)
+            image = train_resize(image)
+            if args.center_crop:
+                y1 = max(0, int(round((image.height - args.resolution) / 2.0)))
+                x1 = max(0, int(round((image.width - args.resolution) / 2.0)))
+                image = train_crop(image)
+            else:
+                y1, x1, h, w = train_crop.get_params(image, (args.resolution, args.resolution))
+                image = crop(image, y1, x1, h, w)
+            if args.random_flip and random.random() < 0.5:
+                # flip
+                x1 = image.width - x1
+                image = train_flip(image)
+            crop_top_left = (y1, x1)
+            image = train_transforms(image)
 
-        image = image.unsqueeze(0)
-        image = image.to(device=vae.device, dtype=vae.dtype)
-        with torch.no_grad():
-            latent = (vae.encode(image).latent_dist.sample() * vae.config.scaling_factor).to('cpu')
+            image = image.unsqueeze(0)
+            image = image.to(device=vae.device, dtype=vae.dtype)
+            with torch.no_grad():
+                latent = (vae.encode(image).latent_dist.sample() * vae.config.scaling_factor).to('cpu')
 
-        np.savez(
-            filename,
-            latent=latent.float().cpu().squeeze().numpy(),
-            original_size=np.array(original_size),
-            crop_top_left=np.array(crop_top_left)
-        )
+            np.savez(
+                filename,
+                latent=latent.float().cpu().squeeze().numpy(),
+                original_size=np.array(original_size),
+                crop_top_left=np.array(crop_top_left)
+            )
+        accelerator.wait_for_everyone()
         
     # free vae
     vae.to('cpu')
