@@ -1,3 +1,5 @@
 /model
 /YiffyMixv51XL-lora-lcm-sdxl
 /dataset
+/__pycache__
+/cache

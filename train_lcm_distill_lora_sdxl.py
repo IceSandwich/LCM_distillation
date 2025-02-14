@@ -42,6 +42,8 @@ from torchvision import transforms
 from torchvision.transforms.functional import crop
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
+import datasets
+import common
 
 import diffusers
 from diffusers import (
@@ -105,97 +107,6 @@ class DDIMSolver:
         x_prev = alpha_cumprod_prev.sqrt() * pred_x0 + dir_xt
         return x_prev
 
-validation_prompts = [
-    "cute sundar pichai character",
-    "robotic cat with wings",
-    "a photo of yoda",
-    "a cute creature with blue eyes",
-]
-def log_validation(vae, args, accelerator, weight_dtype, step, unet=None, is_final_validation=False):
-    logger.info("Running validation... ")
-
-    pipeline = StableDiffusionXLPipeline.from_pretrained(
-        args.pretrained_teacher_model,
-        vae=vae,
-        scheduler=LCMScheduler.from_pretrained(args.pretrained_teacher_model, subfolder="scheduler"),
-        revision=args.revision,
-        torch_dtype=weight_dtype,
-    ).to(accelerator.device)
-    pipeline.set_progress_bar_config(disable=True)
-
-    to_load = None
-    if not is_final_validation:
-        if unet is None:
-            raise ValueError("Must provide a `unet` when doing intermediate validation.")
-        unet = accelerator.unwrap_model(unet)
-        state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unet))
-        to_load = state_dict
-    else:
-        to_load = args.output_dir
-
-    pipeline.load_lora_weights(to_load)
-    pipeline.fuse_lora()
-
-    if args.enable_xformers_memory_efficient_attention:
-        pipeline.enable_xformers_memory_efficient_attention()
-
-    if args.seed is None:
-        generator = None
-    else:
-        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
-        
-    image_logs = []
-
-    for _, prompt in enumerate(validation_prompts):
-        images = []
-        if torch.backends.mps.is_available():
-            autocast_ctx = nullcontext()
-        else:
-            autocast_ctx = torch.autocast(accelerator.device.type, dtype=weight_dtype)
-
-        with autocast_ctx:
-            images = pipeline(
-                prompt=prompt,
-                num_inference_steps=4,
-                num_images_per_prompt=4,
-                generator=generator,
-                guidance_scale=0.0,
-            ).images
-        image_logs.append({"validation_prompt": prompt, "images": images})
-
-    for tracker in accelerator.trackers:
-        if tracker.name == "tensorboard":
-            for log in image_logs:
-                images = log["images"]
-                validation_prompt = log["validation_prompt"]
-                formatted_images = []
-                for image in images:
-                    formatted_images.append(np.asarray(image))
-
-                formatted_images = np.stack(formatted_images)
-
-                tracker.writer.add_images(validation_prompt, formatted_images, step, dataformats="NHWC")
-        elif tracker.name == "wandb":
-            formatted_images = []
-
-            for log in image_logs:
-                images = log["images"]
-                validation_prompt = log["validation_prompt"]
-                for image in images:
-                    image = wandb.Image(image, caption=validation_prompt)
-                    formatted_images.append(image)
-            logger_name = "test" if is_final_validation else "validation"
-            tracker.log({logger_name: formatted_images})
-        else:
-            logger.warning(f"image logging not implemented for {tracker.name}")
-
-        del pipeline
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        return image_logs
-
-
 def append_dims(x, target_dims):
     """Appends dimensions to the end of a tensor until it has target_dims dimensions."""
     dims_to_append = target_dims - x.ndim
@@ -249,32 +160,10 @@ def get_predicted_noise(model_output, timesteps, sample, prediction_type, alphas
 
     return pred_epsilon
 
-
 def extract_into_tensor(a, t, x_shape):
     b, *_ = t.shape
     out = a.gather(-1, t)
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
-
-
-def import_model_class_from_model_name_or_path(
-    pretrained_model_name_or_path: str, revision: str, subfolder: str = "text_encoder"
-):
-    text_encoder_config = PretrainedConfig.from_pretrained(
-        pretrained_model_name_or_path, subfolder=subfolder, revision=revision
-    )
-    model_class = text_encoder_config.architectures[0]
-
-    if model_class == "CLIPTextModel":
-        from transformers import CLIPTextModel
-
-        return CLIPTextModel
-    elif model_class == "CLIPTextModelWithProjection":
-        from transformers import CLIPTextModelWithProjection
-
-        return CLIPTextModelWithProjection
-    else:
-        raise ValueError(f"{model_class} is not supported.")
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -317,7 +206,7 @@ def parse_args():
     parser.add_argument(
         "--cache_dir",
         type=str,
-        default=None,
+        default="./cache",
         help="The directory where the downloaded models and datasets will be stored.",
     )
     parser.add_argument("--seed", type=int, default=42, help="A seed for reproducible training.")
@@ -632,13 +521,6 @@ def parse_args():
     )
     # ----Distributed Training----
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
-    # ----------Validation Arguments----------
-    parser.add_argument(
-        "--validation_steps",
-        type=int,
-        default=200,
-        help="Run validation every X steps.",
-    )
     # ----------Huggingface Hub Arguments-----------
     parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
     parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
@@ -652,7 +534,7 @@ def parse_args():
     parser.add_argument(
         "--tracker_project_name",
         type=str,
-        default="text2image-fine-tune",
+        default="text2image-fine-tune-{timestamp}",
         help=(
             "The `project_name` argument passed to Accelerator.init_trackers for"
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
@@ -684,46 +566,6 @@ def parse_args():
         args.local_rank = env_local_rank
 
     return args
-
-
-# Adapted from pipelines.StableDiffusionXLPipeline.encode_prompt
-def encode_prompt(prompt_batch, text_encoders, tokenizers, is_train=True):
-    prompt_embeds_list = []
-
-    captions = []
-    for caption in prompt_batch:
-        if isinstance(caption, str):
-            captions.append(caption)
-        elif isinstance(caption, (list, np.ndarray)):
-            # take a random caption if there are multiple
-            captions.append(random.choice(caption) if is_train else caption[0])
-
-    with torch.no_grad():
-        for tokenizer, text_encoder in zip(tokenizers, text_encoders):
-            text_inputs = tokenizer(
-                captions,
-                padding="max_length",
-                max_length=tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
-            text_input_ids = text_inputs.input_ids
-            prompt_embeds = text_encoder(
-                text_input_ids.to(text_encoder.device),
-                output_hidden_states=True,
-            )
-
-            # We are only ALWAYS interested in the pooled output of the final text encoder
-            pooled_prompt_embeds = prompt_embeds[0]
-            prompt_embeds = prompt_embeds.hidden_states[-2]
-            bs_embed, seq_len, _ = prompt_embeds.shape
-            prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
-            prompt_embeds_list.append(prompt_embeds)
-
-    prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
-    pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
-    return prompt_embeds, pooled_prompt_embeds
-
 
 def main(args):
     if args.report_to == "wandb" and args.hub_token is not None:
@@ -805,10 +647,10 @@ def main(args):
 
     # 3. Load text encoders from SDXL checkpoint.
     # import correct text encoder classes
-    text_encoder_cls_one = import_model_class_from_model_name_or_path(
+    text_encoder_cls_one = common.import_model_class_from_model_name_or_path(
         args.pretrained_teacher_model, args.teacher_revision
     )
-    text_encoder_cls_two = import_model_class_from_model_name_or_path(
+    text_encoder_cls_two = common.import_model_class_from_model_name_or_path(
         args.pretrained_teacher_model, args.teacher_revision, subfolder="text_encoder_2"
     )
 
@@ -1000,6 +842,9 @@ def main(args):
     # 13. Dataset creation and data processing
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
+    if not os.path.exists(args.cache_dir):
+        os.makedirs(args.cache_dir)
+        print("Create cache dir: ", args.cache_dir)
     if args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
         dataset = load_dataset(
@@ -1008,14 +853,38 @@ def main(args):
             cache_dir=args.cache_dir,
         )
     else:
-        data_files = {}
-        if args.train_data_dir is not None:
-            data_files["train"] = os.path.join(args.train_data_dir, "**")
-        dataset = load_dataset(
-            "imagefolder",
-            data_files=data_files,
-            cache_dir=args.cache_dir,
-        )
+        def make_dataset(folder: str):
+            from PIL import Image
+            ret = {
+                "image": [],
+                "filename": [],
+                "text": [],
+            }
+            for filename in [ x for x in os.listdir(folder) if x.endswith('.png') or x.endswith('jpg') ]:
+                image = Image.open(os.path.join(folder, filename)).convert("RGB")
+                if "parameters" in image.info:
+                    parameters = image.info["parameters"].split("\n")
+                    prompt  = parameters[0]
+                else:
+                    with open(os.path.join(folder, os.path.splitext(filename)[0] + ".txt"), 'r') as f:
+                        prompt = f.read().strip('\n').strip('\r').strip()
+
+                ret["image"].append(image.copy())
+                ret["filename"].append(filename)
+                ret["text"].append(prompt)
+            return datasets.Dataset.from_dict(ret)
+        dataset = datasets.DatasetDict({
+            "train": make_dataset(args.train_data_dir)
+        })
+        print("Dataset: ", dataset)
+        # data_files = {}
+        # if args.train_data_dir is not None:
+        #     data_files["train"] = os.path.join(args.train_data_dir, "**")
+        # dataset = load_dataset(
+        #     "imagefolder",
+        #     data_files=data_files,
+        #     cache_dir=args.cache_dir,
+        # )
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
 
@@ -1052,7 +921,7 @@ def main(args):
     vae.requires_grad_(False)
     vae.eval()
     def convert_filename_to_npz_filename(filename: str):
-        return os.path.join(args.train_data_dir, os.path.splitext(filename)[0] + ".npz")
+        return os.path.join(args.cache_dir, os.path.splitext(filename)[0] + ".npz")
     for data in tqdm(dataset["train"], "cache latents"):
         filename = convert_filename_to_npz_filename(data["filename"])
         image = data["image"]
@@ -1143,30 +1012,16 @@ def main(args):
     )
 
     # 14. Embeddings for the UNet.
-    # Adapted from pipeline.StableDiffusionXLPipeline._get_add_time_ids
-    def compute_embeddings(prompt_batch, original_sizes, crop_coords, text_encoders, tokenizers, is_train=True):
-        def compute_time_ids(original_size, crops_coords_top_left):
-            target_size = (args.resolution, args.resolution)
-            add_time_ids = list(original_size + crops_coords_top_left + target_size)
-            add_time_ids = torch.tensor([add_time_ids])
-            add_time_ids = add_time_ids.to(accelerator.device, dtype=weight_dtype)
-            return add_time_ids
-
-        prompt_embeds, pooled_prompt_embeds = encode_prompt(prompt_batch, text_encoders, tokenizers, is_train)
-        add_text_embeds = pooled_prompt_embeds
-
-        add_time_ids = torch.cat([compute_time_ids(s, c) for s, c in zip(original_sizes, crop_coords)])
-
-        prompt_embeds = prompt_embeds.to(accelerator.device)
-        add_text_embeds = add_text_embeds.to(accelerator.device)
-        unet_added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
-
-        return {"prompt_embeds": prompt_embeds, **unet_added_cond_kwargs}
-
     text_encoders = [text_encoder_one, text_encoder_two]
     tokenizers = [tokenizer_one, tokenizer_two]
 
-    compute_embeddings_fn = functools.partial(compute_embeddings, text_encoders=text_encoders, tokenizers=tokenizers)
+    compute_embeddings_fn = functools.partial(common.compute_embeddings, 
+                                              resolution=args.resolution,
+                                              device=accelerator.device,
+                                              weight_dtype=weight_dtype,
+                                              text_encoders=text_encoders, 
+                                              tokenizers=tokenizers
+                                              )
 
     # 15. LR Scheduler creation
     # Scheduler and math around the number of training steps.
@@ -1219,9 +1074,13 @@ def main(args):
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
+    tracker_project_name = args.tracker_project_name
+    if "{timestamp}" in tracker_project_name:
+        import time
+        tracker_project_name = tracker_project_name.replace("{timestamp}", time.time().replace('-', _))
     if accelerator.is_main_process:
         tracker_config = dict(vars(args))
-        accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
+        accelerator.init_trackers(tracker_project_name, config=tracker_config)
 
     # 17. Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -1498,16 +1357,15 @@ def main(args):
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
-
-                    if global_step % args.validation_steps == 0:
-                        log_validation(
-                            vae, args, accelerator, weight_dtype, global_step, unet=unet, is_final_validation=False
-                        )
+            
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
+            accelerator.print(f"loss:", logs["loss"], " lr:", logs["lr"])
 
+            gc.collect()
+            torch.cuda.empty_cache()
             if global_step >= args.max_train_steps:
                 break
 
@@ -1529,12 +1387,7 @@ def main(args):
         del unet
         torch.cuda.empty_cache()
 
-        # Final inference.
-        if args.validation_steps is not None:
-            log_validation(vae, args, accelerator, weight_dtype, step=global_step, unet=None, is_final_validation=True)
-
     accelerator.end_training()
-
 
 if __name__ == "__main__":
     args = parse_args()
