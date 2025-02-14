@@ -923,9 +923,9 @@ def main(args):
     # Cache latents to disk
     vae.requires_grad_(False)
     vae.eval()
+    def convert_filename_to_npz_filename(filename: str):
+        return os.path.join(args.cache_dir, os.path.splitext(filename)[0] + ".npz")
     if accelerator.is_main_process:
-        def convert_filename_to_npz_filename(filename: str):
-            return os.path.join(args.cache_dir, os.path.splitext(filename)[0] + ".npz")
         for data in tqdm(dataset["train"], "cache latents"):
             filename = convert_filename_to_npz_filename(data["filename"])
             image = data["image"]
