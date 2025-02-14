@@ -847,7 +847,7 @@ def main(args):
             os.makedirs(args.cache_dir)
             print("Create cache dir: ", args.cache_dir)
     accelerator.wait_for_everyone()
-    
+
     if args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
         dataset = load_dataset(
@@ -956,7 +956,6 @@ def main(args):
                 original_size=np.array(original_size),
                 crop_top_left=np.array(crop_top_left)
             )
-        accelerator.wait_for_everyone()
         
     # free vae
     vae.to('cpu')
