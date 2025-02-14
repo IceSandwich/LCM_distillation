@@ -559,6 +559,11 @@ def parse_args():
         default=None,
         help="use to generate validation image into tensorboard"
     )
+    parser.add_argument(
+        "--low_vram",
+        action="store_true",
+        help="indicated that the vram is low"
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -1368,8 +1373,9 @@ def main(args):
             accelerator.log(logs, step=global_step)
             accelerator.print(f"loss:", logs["loss"], " lr:", logs["lr"])
 
-            gc.collect()
-            torch.cuda.empty_cache()
+            if args.low_vram:
+                gc.collect()
+                torch.cuda.empty_cache()
             if global_step >= args.max_train_steps:
                 break
 
