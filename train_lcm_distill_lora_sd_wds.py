@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # coding=utf-8
-# Copyright 2024 The LCM team and the HuggingFace Inc. team. All rights reserved.
+# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,9 +14,10 @@
 # See the License for the specific language governing permissions and
 
 import argparse
-import copy
 import functools
 import gc
+import itertools
+import json
 import logging
 import math
 import os
@@ -24,88 +25,332 @@ import random
 import shutil
 from contextlib import nullcontext
 from pathlib import Path
+from typing import List, Union
 
 import accelerate
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
+import torchvision.transforms.functional as TF
 import transformers
+import webdataset as wds
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
-from datasets import load_dataset
+from braceexpand import braceexpand
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
-from peft import LoraConfig, get_peft_model_state_dict, set_peft_model_state_dict
+from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
+from torch.utils.data import default_collate
 from torchvision import transforms
-from torchvision.transforms.functional import crop
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer, PretrainedConfig
-import datasets
-import common
+from transformers import AutoTokenizer, CLIPTextModel, PretrainedConfig
+from webdataset.tariterators import (
+    base_plus_ext,
+    tar_file_expander,
+    url_opener,
+    valid_sample,
+)
 
 import diffusers
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
     LCMScheduler,
-    StableDiffusionXLPipeline,
+    StableDiffusionPipeline,
     UNet2DConditionModel,
 )
 from diffusers.optimization import get_scheduler
-from diffusers.training_utils import cast_training_params, resolve_interpolation_mode
-from diffusers.utils import (
-    check_min_version,
-    convert_state_dict_to_diffusers,
-    convert_unet_state_dict_to_peft,
-    is_wandb_available,
-)
+from diffusers.training_utils import resolve_interpolation_mode
+from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
-import sys
-sys.path.append("sdscripts")
-from sdscripts.library.device_utils import clean_memory_on_device
+
+MAX_SEQ_LENGTH = 77
 
 if is_wandb_available():
     import wandb
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-# check_min_version("0.33.0.dev0")
+check_min_version("0.33.0.dev0")
 
 logger = get_logger(__name__)
 
-DATASET_NAME_MAPPING = {
-    "lambdalabs/naruto-blip-captions": ("image", "text"),
-}
+
+def get_module_kohya_state_dict(module, prefix: str, dtype: torch.dtype, adapter_name: str = "default"):
+    kohya_ss_state_dict = {}
+    for peft_key, weight in get_peft_model_state_dict(module, adapter_name=adapter_name).items():
+        kohya_key = peft_key.replace("base_model.model", prefix)
+        kohya_key = kohya_key.replace("lora_A", "lora_down")
+        kohya_key = kohya_key.replace("lora_B", "lora_up")
+        kohya_key = kohya_key.replace(".", "_", kohya_key.count(".") - 2)
+        kohya_ss_state_dict[kohya_key] = weight.to(dtype)
+
+        # Set alpha parameter
+        if "lora_down" in kohya_key:
+            alpha_key = f'{kohya_key.split(".")[0]}.alpha'
+            kohya_ss_state_dict[alpha_key] = torch.tensor(module.peft_config[adapter_name].lora_alpha).to(dtype)
+
+    return kohya_ss_state_dict
 
 
-class DDIMSolver:
-    def __init__(self, alpha_cumprods, timesteps=1000, ddim_timesteps=50):
-        # DDIM sampling parameters
-        step_ratio = timesteps // ddim_timesteps
+def filter_keys(key_set):
+    def _f(dictionary):
+        return {k: v for k, v in dictionary.items() if k in key_set}
 
-        self.ddim_timesteps = (np.arange(1, ddim_timesteps + 1) * step_ratio).round().astype(np.int64) - 1
-        self.ddim_alpha_cumprods = alpha_cumprods[self.ddim_timesteps]
-        self.ddim_alpha_cumprods_prev = np.asarray(
-            [alpha_cumprods[0]] + alpha_cumprods[self.ddim_timesteps[:-1]].tolist()
+    return _f
+
+
+def group_by_keys_nothrow(data, keys=base_plus_ext, lcase=True, suffixes=None, handler=None):
+    """Return function over iterator that groups key, value pairs into samples.
+
+    :param keys: function that splits the key into key and extension (base_plus_ext) :param lcase: convert suffixes to
+    lower case (Default value = True)
+    """
+    current_sample = None
+    for filesample in data:
+        assert isinstance(filesample, dict)
+        fname, value = filesample["fname"], filesample["data"]
+        prefix, suffix = keys(fname)
+        if prefix is None:
+            continue
+        if lcase:
+            suffix = suffix.lower()
+        # FIXME webdataset version throws if suffix in current_sample, but we have a potential for
+        #  this happening in the current LAION400m dataset if a tar ends with same prefix as the next
+        #  begins, rare, but can happen since prefix aren't unique across tar files in that dataset
+        if current_sample is None or prefix != current_sample["__key__"] or suffix in current_sample:
+            if valid_sample(current_sample):
+                yield current_sample
+            current_sample = {"__key__": prefix, "__url__": filesample["__url__"]}
+        if suffixes is None or suffix in suffixes:
+            current_sample[suffix] = value
+    if valid_sample(current_sample):
+        yield current_sample
+
+
+def tarfile_to_samples_nothrow(src, handler=wds.warn_and_continue):
+    # NOTE this is a re-impl of the webdataset impl with group_by_keys that doesn't throw
+    streams = url_opener(src, handler=handler)
+    files = tar_file_expander(streams, handler=handler)
+    samples = group_by_keys_nothrow(files, handler=handler)
+    return samples
+
+
+class WebdatasetFilter:
+    def __init__(self, min_size=1024, max_pwatermark=0.5):
+        self.min_size = min_size
+        self.max_pwatermark = max_pwatermark
+
+    def __call__(self, x):
+        try:
+            if "json" in x:
+                x_json = json.loads(x["json"])
+                filter_size = (x_json.get("original_width", 0.0) or 0.0) >= self.min_size and x_json.get(
+                    "original_height", 0
+                ) >= self.min_size
+                filter_watermark = (x_json.get("pwatermark", 1.0) or 1.0) <= self.max_pwatermark
+                return filter_size and filter_watermark
+            else:
+                return False
+        except Exception:
+            return False
+
+
+class SDText2ImageDataset:
+    def __init__(
+        self,
+        train_shards_path_or_url: Union[str, List[str]],
+        num_train_examples: int,
+        per_gpu_batch_size: int,
+        global_batch_size: int,
+        num_workers: int,
+        resolution: int = 512,
+        interpolation_type: str = "bilinear",
+        shuffle_buffer_size: int = 1000,
+        pin_memory: bool = False,
+        persistent_workers: bool = False,
+    ):
+        if not isinstance(train_shards_path_or_url, str):
+            train_shards_path_or_url = [list(braceexpand(urls)) for urls in train_shards_path_or_url]
+            # flatten list using itertools
+            train_shards_path_or_url = list(itertools.chain.from_iterable(train_shards_path_or_url))
+
+        interpolation_mode = resolve_interpolation_mode(interpolation_type)
+
+        def transform(example):
+            # resize image
+            image = example["image"]
+            image = TF.resize(image, resolution, interpolation=interpolation_mode)
+
+            # get crop coordinates and crop image
+            c_top, c_left, _, _ = transforms.RandomCrop.get_params(image, output_size=(resolution, resolution))
+            image = TF.crop(image, c_top, c_left, resolution, resolution)
+            image = TF.to_tensor(image)
+            image = TF.normalize(image, [0.5], [0.5])
+
+            example["image"] = image
+            return example
+
+        processing_pipeline = [
+            wds.decode("pil", handler=wds.ignore_and_continue),
+            wds.rename(image="jpg;png;jpeg;webp", text="text;txt;caption", handler=wds.warn_and_continue),
+            wds.map(filter_keys({"image", "text"})),
+            wds.map(transform),
+            wds.to_tuple("image", "text"),
+        ]
+
+        # Create train dataset and loader
+        pipeline = [
+            wds.ResampledShards(train_shards_path_or_url),
+            tarfile_to_samples_nothrow,
+            wds.shuffle(shuffle_buffer_size),
+            *processing_pipeline,
+            wds.batched(per_gpu_batch_size, partial=False, collation_fn=default_collate),
+        ]
+
+        num_worker_batches = math.ceil(num_train_examples / (global_batch_size * num_workers))  # per dataloader worker
+        num_batches = num_worker_batches * num_workers
+        num_samples = num_batches * global_batch_size
+
+        # each worker is iterating over this
+        self._train_dataset = wds.DataPipeline(*pipeline).with_epoch(num_worker_batches)
+        self._train_dataloader = wds.WebLoader(
+            self._train_dataset,
+            batch_size=None,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
         )
-        # convert to torch tensors
-        self.ddim_timesteps = torch.from_numpy(self.ddim_timesteps).long()
-        self.ddim_alpha_cumprods = torch.from_numpy(self.ddim_alpha_cumprods)
-        self.ddim_alpha_cumprods_prev = torch.from_numpy(self.ddim_alpha_cumprods_prev)
+        # add meta-data to dataloader instance for convenience
+        self._train_dataloader.num_batches = num_batches
+        self._train_dataloader.num_samples = num_samples
 
-    def to(self, device):
-        self.ddim_timesteps = self.ddim_timesteps.to(device)
-        self.ddim_alpha_cumprods = self.ddim_alpha_cumprods.to(device)
-        self.ddim_alpha_cumprods_prev = self.ddim_alpha_cumprods_prev.to(device)
-        return self
+    @property
+    def train_dataset(self):
+        return self._train_dataset
 
-    def ddim_step(self, pred_x0, pred_noise, timestep_index):
-        alpha_cumprod_prev = extract_into_tensor(self.ddim_alpha_cumprods_prev, timestep_index, pred_x0.shape)
-        dir_xt = (1.0 - alpha_cumprod_prev).sqrt() * pred_noise
-        x_prev = alpha_cumprod_prev.sqrt() * pred_x0 + dir_xt
-        return x_prev
+    @property
+    def train_dataloader(self):
+        return self._train_dataloader
+
+
+def log_validation(vae, unet, args, accelerator, weight_dtype, step):
+    logger.info("Running validation... ")
+    if torch.backends.mps.is_available():
+        autocast_ctx = nullcontext()
+    else:
+        autocast_ctx = torch.autocast(accelerator.device.type, dtype=weight_dtype)
+
+    unet = accelerator.unwrap_model(unet)
+    pipeline = StableDiffusionPipeline.from_pretrained(
+        args.pretrained_teacher_model,
+        vae=vae,
+        scheduler=LCMScheduler.from_pretrained(args.pretrained_teacher_model, subfolder="scheduler"),
+        revision=args.revision,
+        torch_dtype=weight_dtype,
+        safety_checker=None,
+    )
+    pipeline.set_progress_bar_config(disable=True)
+
+    lora_state_dict = get_module_kohya_state_dict(unet, "lora_unet", weight_dtype)
+    pipeline.load_lora_weights(lora_state_dict)
+    pipeline.fuse_lora()
+
+    pipeline = pipeline.to(accelerator.device, dtype=weight_dtype)
+    if args.enable_xformers_memory_efficient_attention:
+        pipeline.enable_xformers_memory_efficient_attention()
+
+    if args.seed is None:
+        generator = None
+    else:
+        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+
+    validation_prompts = [
+        "portrait photo of a girl, photograph, highly detailed face, depth of field, moody light, golden hour, style by Dan Winters, Russell James, Steve McCurry, centered, extremely detailed, Nikon D850, award winning photography",
+        "Self-portrait oil painting, a beautiful cyborg with golden hair, 8k",
+        "Astronaut in a jungle, cold color palette, muted colors, detailed, 8k",
+        "A photo of beautiful mountain with realistic sunset and blue lake, highly detailed, masterpiece",
+    ]
+
+    image_logs = []
+
+    for _, prompt in enumerate(validation_prompts):
+        images = []
+        with autocast_ctx:
+            images = pipeline(
+                prompt=prompt,
+                num_inference_steps=4,
+                num_images_per_prompt=4,
+                generator=generator,
+                guidance_scale=1.0,
+            ).images
+        image_logs.append({"validation_prompt": prompt, "images": images})
+
+    for tracker in accelerator.trackers:
+        if tracker.name == "tensorboard":
+            for log in image_logs:
+                images = log["images"]
+                validation_prompt = log["validation_prompt"]
+                formatted_images = []
+                for image in images:
+                    formatted_images.append(np.asarray(image))
+
+                formatted_images = np.stack(formatted_images)
+
+                tracker.writer.add_images(validation_prompt, formatted_images, step, dataformats="NHWC")
+        elif tracker.name == "wandb":
+            formatted_images = []
+
+            for log in image_logs:
+                images = log["images"]
+                validation_prompt = log["validation_prompt"]
+                for image in images:
+                    image = wandb.Image(image, caption=validation_prompt)
+                    formatted_images.append(image)
+
+            tracker.log({"validation": formatted_images})
+        else:
+            logger.warning(f"image logging not implemented for {tracker.name}")
+
+        del pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        return image_logs
+
+
+# From LatentConsistencyModel.get_guidance_scale_embedding
+def guidance_scale_embedding(w, embedding_dim=512, dtype=torch.float32):
+    """
+    See https://github.com/google-research/vdm/blob/dc27b98a554f65cdc654b800da5aa1846545d41b/model_vdm.py#L298
+
+    Args:
+        timesteps (`torch.Tensor`):
+            generate embedding vectors at these timesteps
+        embedding_dim (`int`, *optional*, defaults to 512):
+            dimension of the embeddings to generate
+        dtype:
+            data type of the generated embeddings
+
+    Returns:
+        `torch.Tensor`: Embedding vectors with shape `(len(timesteps), embedding_dim)`
+    """
+    assert len(w.shape) == 1
+    w = w * 1000.0
+
+    half_dim = embedding_dim // 2
+    emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, dtype=dtype) * -emb)
+    emb = w.to(dtype)[:, None] * emb[None, :]
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+    if embedding_dim % 2 == 1:  # zero pad
+        emb = torch.nn.functional.pad(emb, (0, 1))
+    assert emb.shape == (w.shape[0], embedding_dim)
+    return emb
+
 
 def append_dims(x, target_dims):
     """Appends dimensions to the end of a tensor until it has target_dims dimensions."""
@@ -160,10 +405,73 @@ def get_predicted_noise(model_output, timesteps, sample, prediction_type, alphas
 
     return pred_epsilon
 
+
 def extract_into_tensor(a, t, x_shape):
     b, *_ = t.shape
     out = a.gather(-1, t)
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+
+
+class DDIMSolver:
+    def __init__(self, alpha_cumprods, timesteps=1000, ddim_timesteps=50):
+        # DDIM sampling parameters
+        step_ratio = timesteps // ddim_timesteps
+        self.ddim_timesteps = (np.arange(1, ddim_timesteps + 1) * step_ratio).round().astype(np.int64) - 1
+        self.ddim_alpha_cumprods = alpha_cumprods[self.ddim_timesteps]
+        self.ddim_alpha_cumprods_prev = np.asarray(
+            [alpha_cumprods[0]] + alpha_cumprods[self.ddim_timesteps[:-1]].tolist()
+        )
+        # convert to torch tensors
+        self.ddim_timesteps = torch.from_numpy(self.ddim_timesteps).long()
+        self.ddim_alpha_cumprods = torch.from_numpy(self.ddim_alpha_cumprods)
+        self.ddim_alpha_cumprods_prev = torch.from_numpy(self.ddim_alpha_cumprods_prev)
+
+    def to(self, device):
+        self.ddim_timesteps = self.ddim_timesteps.to(device)
+        self.ddim_alpha_cumprods = self.ddim_alpha_cumprods.to(device)
+        self.ddim_alpha_cumprods_prev = self.ddim_alpha_cumprods_prev.to(device)
+        return self
+
+    def ddim_step(self, pred_x0, pred_noise, timestep_index):
+        alpha_cumprod_prev = extract_into_tensor(self.ddim_alpha_cumprods_prev, timestep_index, pred_x0.shape)
+        dir_xt = (1.0 - alpha_cumprod_prev).sqrt() * pred_noise
+        x_prev = alpha_cumprod_prev.sqrt() * pred_x0 + dir_xt
+        return x_prev
+
+
+@torch.no_grad()
+def update_ema(target_params, source_params, rate=0.99):
+    """
+    Update target parameters to be closer to those of source parameters using
+    an exponential moving average.
+
+    :param target_params: the target parameter sequence.
+    :param source_params: the source parameter sequence.
+    :param rate: the EMA rate (closer to 1 means slower).
+    """
+    for targ, src in zip(target_params, source_params):
+        targ.detach().mul_(rate).add_(src, alpha=1 - rate)
+
+
+def import_model_class_from_model_name_or_path(
+    pretrained_model_name_or_path: str, revision: str, subfolder: str = "text_encoder"
+):
+    text_encoder_config = PretrainedConfig.from_pretrained(
+        pretrained_model_name_or_path, subfolder=subfolder, revision=revision
+    )
+    model_class = text_encoder_config.architectures[0]
+
+    if model_class == "CLIPTextModel":
+        from transformers import CLIPTextModel
+
+        return CLIPTextModel
+    elif model_class == "CLIPTextModelWithProjection":
+        from transformers import CLIPTextModelWithProjection
+
+        return CLIPTextModelWithProjection
+    else:
+        raise ValueError(f"{model_class} is not supported.")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -206,10 +514,10 @@ def parse_args():
     parser.add_argument(
         "--cache_dir",
         type=str,
-        default="./cache",
+        default=None,
         help="The directory where the downloaded models and datasets will be stored.",
     )
-    parser.add_argument("--seed", type=int, default=42, help="A seed for reproducible training.")
+    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     # ----Logging----
     parser.add_argument(
         "--logging_dir",
@@ -256,7 +564,7 @@ def parse_args():
     )
     # ----Image Processing----
     parser.add_argument(
-        "--dataset_name",
+        "--train_shards_path_or_url",
         type=str,
         default=None,
         help=(
@@ -266,34 +574,9 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--dataset_config_name",
-        type=str,
-        default=None,
-        help="The config of the Dataset, leave as None if there's only one config.",
-    )
-    parser.add_argument(
-        "--train_data_dir",
-        type=str,
-        default=None,
-        help=(
-            "A folder containing the training data. Folder contents must follow the structure described in"
-            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
-            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
-        ),
-    )
-    parser.add_argument(
-        "--image_column", type=str, default="image", help="The column of the dataset containing an image."
-    )
-    parser.add_argument(
-        "--caption_column",
-        type=str,
-        default="text",
-        help="The column of the dataset containing a caption or a list of captions.",
-    )
-    parser.add_argument(
         "--resolution",
         type=int,
-        default=1024,
+        default=512,
         help=(
             "The resolution for input images, all the images in the train/validation dataset will be resized to this"
             " resolution"
@@ -321,12 +604,6 @@ def parse_args():
         "--random_flip",
         action="store_true",
         help="whether to randomly flip images horizontally",
-    )
-    parser.add_argument(
-        "--encode_batch_size",
-        type=int,
-        default=8,
-        help="Batch size to use for VAE encoding of the images for efficient processing.",
     )
     # ----Dataloader----
     parser.add_argument(
@@ -361,7 +638,7 @@ def parse_args():
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=1e-6,
+        default=1e-4,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument(
@@ -398,11 +675,17 @@ def parse_args():
     parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
     # ----Diffusion Training Arguments----
+    parser.add_argument(
+        "--proportion_empty_prompts",
+        type=float,
+        default=0,
+        help="Proportion of image prompts to be replaced with empty strings. Defaults to 0 (no prompt replacement).",
+    )
     # ----Latent Consistency Distillation (LCD) Specific Arguments----
     parser.add_argument(
         "--w_min",
         type=float,
-        default=3.0,
+        default=5.0,
         required=False,
         help=(
             "The minimum guidance scale value for guidance scale sampling. Note that we are using the Imagen CFG"
@@ -473,7 +756,7 @@ def parse_args():
     parser.add_argument(
         "--vae_encode_batch_size",
         type=int,
-        default=8,
+        default=32,
         required=False,
         help=(
             "The batch size used when encoding (and decoding) images to latents (and vice versa) using the VAE."
@@ -510,6 +793,11 @@ def parse_args():
             " https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices"
         ),
     )
+    parser.add_argument(
+        "--cast_teacher_unet",
+        action="store_true",
+        help="Whether to cast the teacher U-Net to the precision specified by `--mixed_precision`.",
+    )
     # ----Training Optimizations----
     parser.add_argument(
         "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
@@ -521,6 +809,13 @@ def parse_args():
     )
     # ----Distributed Training----
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+    # ----------Validation Arguments----------
+    parser.add_argument(
+        "--validation_steps",
+        type=int,
+        default=200,
+        help="Run validation every X steps.",
+    )
     # ----------Huggingface Hub Arguments-----------
     parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
     parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
@@ -540,37 +835,43 @@ def parse_args():
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
-    
-    # ----------Additional-------------------
-    parser.add_argument(
-        "--no_shuffle_tags",
-        action="store_true",
-        help="disable shuffle tags in training."
-    )
-    parser.add_argument(
-        "--activation_tags",
-        type=int,
-        default=1,
-        help="keep first n tags order, do not shuffle them."
-    )
-    parser.add_argument(
-        "--validation_promptfile",
-        type=str,
-        default=None,
-        help="use to generate validation image into tensorboard"
-    )
-    parser.add_argument(
-        "--low_vram",
-        action="store_true",
-        help="indicated that the vram is low"
-    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
+    if args.proportion_empty_prompts < 0 or args.proportion_empty_prompts > 1:
+        raise ValueError("`--proportion_empty_prompts` must be in the range [0, 1].")
+
     return args
+
+
+# Adapted from pipelines.StableDiffusionPipeline.encode_prompt
+def encode_prompt(prompt_batch, text_encoder, tokenizer, proportion_empty_prompts, is_train=True):
+    captions = []
+    for caption in prompt_batch:
+        if random.random() < proportion_empty_prompts:
+            captions.append("")
+        elif isinstance(caption, str):
+            captions.append(caption)
+        elif isinstance(caption, (list, np.ndarray)):
+            # take a random caption if there are multiple
+            captions.append(random.choice(caption) if is_train else caption[0])
+
+    with torch.no_grad():
+        text_inputs = tokenizer(
+            captions,
+            padding="max_length",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        text_input_ids = text_inputs.input_ids
+        prompt_embeds = text_encoder(text_input_ids.to(text_encoder.device))[0]
+
+    return prompt_embeds
+
 
 def main(args):
     if args.report_to == "wandb" and args.hub_token is not None:
@@ -604,11 +905,6 @@ def main(args):
     else:
         transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
-        
-    if args.validation_promptfile is not None:
-        global validation_prompts
-        with open(args.validation_promptfile, "r", encoding='utf-8') as f:
-            validation_prompts = [ x.strip() for x in f.readlines() if x.strip() != "" ]
 
     # If passed along, set the training seed now.
     if args.seed is not None:
@@ -642,52 +938,39 @@ def main(args):
         ddim_timesteps=args.num_ddim_timesteps,
     )
 
-    # 2. Load tokenizers from SDXL checkpoint.
-    tokenizer_one = AutoTokenizer.from_pretrained(
+    # 2. Load tokenizers from SD 1.X/2.X checkpoint.
+    tokenizer = AutoTokenizer.from_pretrained(
         args.pretrained_teacher_model, subfolder="tokenizer", revision=args.teacher_revision, use_fast=False
     )
-    tokenizer_two = AutoTokenizer.from_pretrained(
-        args.pretrained_teacher_model, subfolder="tokenizer_2", revision=args.teacher_revision, use_fast=False
-    )
 
-    # 3. Load text encoders from SDXL checkpoint.
+    # 3. Load text encoders from SD 1.X/2.X checkpoint.
     # import correct text encoder classes
-    text_encoder_cls_one = common.import_model_class_from_model_name_or_path(
-        args.pretrained_teacher_model, args.teacher_revision
-    )
-    text_encoder_cls_two = common.import_model_class_from_model_name_or_path(
-        args.pretrained_teacher_model, args.teacher_revision, subfolder="text_encoder_2"
-    )
-
-    text_encoder_one = text_encoder_cls_one.from_pretrained(
+    text_encoder = CLIPTextModel.from_pretrained(
         args.pretrained_teacher_model, subfolder="text_encoder", revision=args.teacher_revision
     )
-    text_encoder_two = text_encoder_cls_two.from_pretrained(
-        args.pretrained_teacher_model, subfolder="text_encoder_2", revision=args.teacher_revision
-    )
 
-    # 4. Load VAE from SDXL checkpoint (or more stable VAE)
-    vae_path = (
-        args.pretrained_teacher_model
-        if args.pretrained_vae_model_name_or_path is None
-        else args.pretrained_vae_model_name_or_path
-    )
+    # 4. Load VAE from SD 1.X/2.X checkpoint
     vae = AutoencoderKL.from_pretrained(
-        vae_path,
-        subfolder="vae" if args.pretrained_vae_model_name_or_path is None else None,
+        args.pretrained_teacher_model,
+        subfolder="vae",
         revision=args.teacher_revision,
     )
 
-    # 6. Freeze teacher vae, text_encoders.
+    # 5. Load teacher U-Net from SD 1.X/2.X checkpoint
+    teacher_unet = UNet2DConditionModel.from_pretrained(
+        args.pretrained_teacher_model, subfolder="unet", revision=args.teacher_revision
+    )
+
+    # 6. Freeze teacher vae, text_encoder, and teacher_unet
     vae.requires_grad_(False)
-    text_encoder_one.requires_grad_(False)
-    text_encoder_two.requires_grad_(False)
+    text_encoder.requires_grad_(False)
+    teacher_unet.requires_grad_(False)
 
     # 7. Create online student U-Net.
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_teacher_model, subfolder="unet", revision=args.teacher_revision
     )
-    unet.requires_grad_(False)
+    unet.train()
 
     # Check that all trainable models are in full precision
     low_precision_error_string = (
@@ -700,26 +983,7 @@ def main(args):
             f"Controlnet loaded as datatype {accelerator.unwrap_model(unet).dtype}. {low_precision_error_string}"
         )
 
-    # 8. Handle mixed precision and device placement
-    # For mixed precision training we cast all non-trainable weigths to half-precision
-    # as these weights are only used for inference, keeping weights in full precision is not required.
-    weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
-
-    # Move unet, vae and text_encoder to device and cast to weight_dtype
-    # The VAE is in float32 to avoid NaN losses.
-    unet.to(accelerator.device, dtype=weight_dtype)
-    if args.pretrained_vae_model_name_or_path is None:
-        vae.to(accelerator.device, dtype=torch.float32)
-    else:
-        vae.to(accelerator.device, dtype=weight_dtype)
-    text_encoder_one.to(accelerator.device, dtype=weight_dtype)
-    text_encoder_two.to(accelerator.device, dtype=weight_dtype)
-
-    # 9. Add LoRA to the student U-Net, only the LoRA projection matrix will be updated by the optimizer.
+    # 8. Add LoRA to the student U-Net, only the LoRA projection matrix will be updated by the optimizer.
     if args.lora_target_modules is not None:
         lora_target_modules = [module_key.strip() for module_key in args.lora_target_modules.split(",")]
     else:
@@ -745,11 +1009,33 @@ def main(args):
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
     )
-    unet.add_adapter(lora_config)
+    unet = get_peft_model(unet, lora_config)
+
+    # 9. Handle mixed precision and device placement
+    # For mixed precision training we cast all non-trainable weigths to half-precision
+    # as these weights are only used for inference, keeping weights in full precision is not required.
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
+    # Move unet, vae and text_encoder to device and cast to weight_dtype
+    # The VAE is in float32 to avoid NaN losses.
+    vae.to(accelerator.device)
+    if args.pretrained_vae_model_name_or_path is not None:
+        vae.to(dtype=weight_dtype)
+    text_encoder.to(accelerator.device, dtype=weight_dtype)
+
+    # Move teacher_unet to device, optionally cast to weight_dtype
+    teacher_unet.to(accelerator.device)
+    if args.cast_teacher_unet:
+        teacher_unet.to(dtype=weight_dtype)
 
     # Also move the alpha and sigma noise schedules to accelerator.device.
     alpha_schedule = alpha_schedule.to(accelerator.device)
     sigma_schedule = sigma_schedule.to(accelerator.device)
+    # Move the ODE solver to accelerator.device.
     solver = solver.to(accelerator.device)
 
     # 10. Handle saving and loading of checkpoints
@@ -759,10 +1045,10 @@ def main(args):
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
                 unet_ = accelerator.unwrap_model(unet)
-                # also save the checkpoints in native `diffusers` format so that it can be easily
-                # be independently loaded via `load_lora_weights()`.
-                state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unet_))
-                StableDiffusionXLPipeline.save_lora_weights(output_dir, unet_lora_layers=state_dict)
+                lora_state_dict = get_peft_model_state_dict(unet_, adapter_name="default")
+                StableDiffusionPipeline.save_lora_weights(os.path.join(output_dir, "unet_lora"), lora_state_dict)
+                # save weights in peft format to be able to load them back
+                unet_.save_pretrained(output_dir)
 
                 for _, model in enumerate(models):
                     # make sure to pop weight so that corresponding model is not saved again
@@ -771,30 +1057,11 @@ def main(args):
         def load_model_hook(models, input_dir):
             # load the LoRA into the model
             unet_ = accelerator.unwrap_model(unet)
-            lora_state_dict, _ = StableDiffusionXLPipeline.lora_state_dict(input_dir)
-            unet_state_dict = {
-                f'{k.replace("unet.", "")}': v for k, v in lora_state_dict.items() if k.startswith("unet.")
-            }
-            unet_state_dict = convert_unet_state_dict_to_peft(unet_state_dict)
-            incompatible_keys = set_peft_model_state_dict(unet_, unet_state_dict, adapter_name="default")
-            if incompatible_keys is not None:
-                # check only for unexpected keys
-                unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
-                if unexpected_keys:
-                    logger.warning(
-                        f"Loading adapter weights from state_dict led to unexpected keys not found in the model: "
-                        f" {unexpected_keys}. "
-                    )
+            unet_.load_adapter(input_dir, "default", is_trainable=True)
 
             for _ in range(len(models)):
                 # pop models so that they are not loaded again
                 models.pop()
-
-            # Make sure the trainable params are in float32. This is again needed since the base models
-            # are in `weight_dtype`. More details:
-            # https://github.com/huggingface/diffusers/pull/6514#discussion_r1449796804
-            if args.mixed_precision == "fp16":
-                cast_training_params(unet_, dtype=torch.float32)
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
@@ -810,6 +1077,8 @@ def main(args):
                     "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
                 )
             unet.enable_xformers_memory_efficient_attention()
+            teacher_unet.enable_xformers_memory_efficient_attention()
+            # target_unet.enable_xformers_memory_efficient_attention()
         else:
             raise ValueError("xformers is not available. Make sure it is installed correctly")
 
@@ -835,9 +1104,8 @@ def main(args):
         optimizer_class = torch.optim.AdamW
 
     # 12. Optimizer creation
-    params_to_optimize = filter(lambda p: p.requires_grad, unet.parameters())
     optimizer = optimizer_class(
-        params_to_optimize,
+        unet.parameters(),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -845,257 +1113,80 @@ def main(args):
     )
 
     # 13. Dataset creation and data processing
-    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
-    if accelerator.is_main_process:
-        if not os.path.exists(args.cache_dir):
-            os.makedirs(args.cache_dir)
-            print("Create cache dir: ", args.cache_dir)
-    accelerator.wait_for_everyone()
+    # Here, we compute not just the text embeddings but also the additional embeddings
+    # needed for the SD XL UNet to operate.
+    def compute_embeddings(prompt_batch, proportion_empty_prompts, text_encoder, tokenizer, is_train=True):
+        prompt_embeds = encode_prompt(prompt_batch, text_encoder, tokenizer, proportion_empty_prompts, is_train)
+        return {"prompt_embeds": prompt_embeds}
 
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        dataset = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-        )
-    else:
-        def make_dataset(folder: str):
-            from PIL import Image
-            ret = {
-                "image": [],
-                "filename": [],
-                "text": [],
-            }
-            for filename in [ x for x in os.listdir(folder) if x.endswith('.png') or x.endswith('.jpg') or x.endswith(".jpeg") ]:
-                image = Image.open(os.path.join(folder, filename)).convert("RGB")
-                if "parameters" in image.info:
-                    parameters = image.info["parameters"].split("\n")
-                    prompt  = parameters[0]
-                else:
-                    with open(os.path.join(folder, os.path.splitext(filename)[0] + ".txt"), 'r') as f:
-                        prompt = f.read().strip('\n').strip('\r').strip()
-
-                ret["image"].append(image.copy())
-                ret["filename"].append(filename)
-                ret["text"].append(prompt)
-            return datasets.Dataset.from_dict(ret)
-        dataset = datasets.DatasetDict({
-            "train": make_dataset(args.train_data_dir)
-        })
-        print("Dataset: ", dataset)
-        # data_files = {}
-        # if args.train_data_dir is not None:
-        #     data_files["train"] = os.path.join(args.train_data_dir, "**")
-        # dataset = load_dataset(
-        #     "imagefolder",
-        #     data_files=data_files,
-        #     cache_dir=args.cache_dir,
-        # )
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
-
-    # Preprocessing the datasets.
-    column_names = dataset["train"].column_names
-
-    # Get the column names for input/target.
-    dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
-    if args.image_column is None:
-        image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
-    else:
-        image_column = args.image_column
-        if image_column not in column_names:
-            raise ValueError(
-                f"--image_column' value '{args.image_column}' needs to be one of: {', '.join(column_names)}"
-            )
-    if args.caption_column is None:
-        caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
-    else:
-        caption_column = args.caption_column
-        if caption_column not in column_names:
-            raise ValueError(
-                f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
-            )
-
-    # Preprocessing the datasets.
-    interpolation_mode = resolve_interpolation_mode(args.interpolation_type)
-    train_resize = transforms.Resize(args.resolution, interpolation=interpolation_mode)
-    train_crop = transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution)
-    train_flip = transforms.RandomHorizontalFlip(p=1.0)
-    train_transforms = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
-
-    # Cache latents to disk
-    vae.requires_grad_(False)
-    vae.eval()
-    def convert_filename_to_npz_filename(filename: str):
-        return os.path.join(args.cache_dir, os.path.splitext(filename)[0] + ".npz")
-    if accelerator.is_main_process:
-        for data in tqdm(dataset["train"], "cache latents"):
-            filename = convert_filename_to_npz_filename(data["filename"])
-            image = data["image"]
-            original_size = (image.height, image.width)
-            image = train_resize(image)
-            if args.center_crop:
-                y1 = max(0, int(round((image.height - args.resolution) / 2.0)))
-                x1 = max(0, int(round((image.width - args.resolution) / 2.0)))
-                image = train_crop(image)
-            else:
-                y1, x1, h, w = train_crop.get_params(image, (args.resolution, args.resolution))
-                image = crop(image, y1, x1, h, w)
-            if args.random_flip and random.random() < 0.5:
-                # flip
-                x1 = image.width - x1
-                image = train_flip(image)
-            crop_top_left = (y1, x1)
-            image = train_transforms(image)
-
-            image = image.unsqueeze(0)
-            image = image.to(device=vae.device, dtype=vae.dtype)
-            with torch.no_grad():
-                latent = (vae.encode(image).latent_dist.sample() * vae.config.scaling_factor).to('cpu')
-
-            np.savez(
-                filename,
-                latent=latent.float().cpu().squeeze().numpy(),
-                original_size=np.array(original_size),
-                crop_top_left=np.array(crop_top_left)
-            )
-        
-    # free vae
-    vae.to('cpu')
-    del vae
-    clean_memory_on_device(accelerator.device)
-    accelerator.wait_for_everyone()
-
-    def preprocess_train(examples):
-        original_sizes = []
-        crop_top_lefts = []
-        cache_latents = []
-
-        for example in examples["filename"]:
-            filename = convert_filename_to_npz_filename(example)
-            cache_info = np.load(filename)
-            original_size = cache_info["original_size"]
-            original_sizes.append((original_size[0], original_size[1]))
-            crop_top_left = cache_info["crop_top_left"]
-            crop_top_lefts.append((crop_top_left[0], crop_top_left[1]))
-            cache_latents.append(torch.asarray(cache_info["latent"]))
-
-        examples["original_sizes"] = original_sizes
-        examples["crop_top_lefts"] = crop_top_lefts
-        examples["captions"] = list(examples[caption_column])
-        examples["cache_latents"] = cache_latents
-        return examples
-
-    with accelerator.main_process_first():
-        if args.max_train_samples is not None:
-            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
-        # Set the training transforms
-        train_dataset = dataset["train"].with_transform(preprocess_train)
-    
-    def collate_fn(examples):
-        # pixel_values = torch.stack([example["pixel_values"] for example in examples])
-        # pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-        
-        cache_latents = torch.stack([example["cache_latents"] for example in examples])
-        original_sizes = [example["original_sizes"] for example in examples]
-        crop_top_lefts = [example["crop_top_lefts"] for example in examples]
-        captions = [example["captions"] for example in examples]
-
-        return {
-            # "pixel_values": pixel_values,
-            "cache_latents": cache_latents,
-            "captions": captions,
-            "original_sizes": original_sizes,
-            "crop_top_lefts": crop_top_lefts,
-        }
-
-    # DataLoaders creation:
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        shuffle=True,
-        collate_fn=collate_fn,
-        batch_size=args.train_batch_size,
+    dataset = SDText2ImageDataset(
+        train_shards_path_or_url=args.train_shards_path_or_url,
+        num_train_examples=args.max_train_samples,
+        per_gpu_batch_size=args.train_batch_size,
+        global_batch_size=args.train_batch_size * accelerator.num_processes,
         num_workers=args.dataloader_num_workers,
+        resolution=args.resolution,
+        interpolation_type=args.interpolation_type,
+        shuffle_buffer_size=1000,
+        pin_memory=True,
+        persistent_workers=True,
+    )
+    train_dataloader = dataset.train_dataloader
+
+    compute_embeddings_fn = functools.partial(
+        compute_embeddings,
+        proportion_empty_prompts=0,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
     )
 
-    # 14. Embeddings for the UNet.
-    text_encoders = [text_encoder_one, text_encoder_two]
-    tokenizers = [tokenizer_one, tokenizer_two]
-
-    compute_embeddings_fn = functools.partial(common.compute_embeddings, 
-                                              resolution=args.resolution,
-                                              device=accelerator.device,
-                                              weight_dtype=weight_dtype,
-                                              text_encoders=text_encoders, 
-                                              tokenizers=tokenizers
-                                              )
-
-    # 15. LR Scheduler creation
+    # 14. LR Scheduler creation
     # Scheduler and math around the number of training steps.
-    # Check the PR https://github.com/huggingface/diffusers/pull/8312 for detailed explanation.
-    num_warmup_steps_for_scheduler = args.lr_warmup_steps * accelerator.num_processes
+    overrode_max_train_steps = False
+    num_update_steps_per_epoch = math.ceil(train_dataloader.num_batches / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
-        len_train_dataloader_after_sharding = math.ceil(len(train_dataloader) / accelerator.num_processes)
-        num_update_steps_per_epoch = math.ceil(len_train_dataloader_after_sharding / args.gradient_accumulation_steps)
-        num_training_steps_for_scheduler = (
-            args.num_train_epochs * num_update_steps_per_epoch * accelerator.num_processes
-        )
-    else:
-        num_training_steps_for_scheduler = args.max_train_steps * accelerator.num_processes
-
-    if args.scale_lr:
-        args.learning_rate = (
-            args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
-        )
-
-    # Make sure the trainable params are in float32.
-    if args.mixed_precision == "fp16":
-        # only upcast trainable parameters (LoRA) into fp32
-        cast_training_params(unet, dtype=torch.float32)
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+        overrode_max_train_steps = True
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
-        num_warmup_steps=num_warmup_steps_for_scheduler,
-        num_training_steps=num_training_steps_for_scheduler,
+        num_warmup_steps=args.lr_warmup_steps,
+        num_training_steps=args.max_train_steps,
     )
 
-    # 16. Prepare for training
+    # 15. Prepare for training
     # Prepare everything with our `accelerator`.
-    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        unet, optimizer, train_dataloader, lr_scheduler
-    )
+    unet, optimizer, lr_scheduler = accelerator.prepare(unet, optimizer, lr_scheduler)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if args.max_train_steps is None:
+    num_update_steps_per_epoch = math.ceil(train_dataloader.num_batches / args.gradient_accumulation_steps)
+    if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-        if num_training_steps_for_scheduler != args.max_train_steps * accelerator.num_processes:
-            logger.warning(
-                f"The length of the 'train_dataloader' after 'accelerator.prepare' ({len(train_dataloader)}) does not match "
-                f"the expected length ({len_train_dataloader_after_sharding}) when the learning rate scheduler was created. "
-                f"This inconsistency may result in the learning rate scheduler not functioning properly."
-            )
     # Afterwards we recalculate our number of training epochs
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
-    tracker_project_name = args.tracker_project_name
-    if "{timestamp}" in tracker_project_name:
-        import time
-        tracker_project_name = tracker_project_name.replace("{timestamp}", time.time().replace('-', _))
     if accelerator.is_main_process:
         tracker_config = dict(vars(args))
-        accelerator.init_trackers(tracker_project_name, config=tracker_config)
+        accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
 
-    # 17. Train!
+    uncond_input_ids = tokenizer(
+        [""] * args.train_batch_size, return_tensors="pt", padding="max_length", max_length=77
+    ).input_ids.to(accelerator.device)
+    uncond_prompt_embeds = text_encoder(uncond_input_ids)[0]
+
+    if torch.backends.mps.is_available():
+        autocast_ctx = nullcontext()
+    else:
+        autocast_ctx = torch.autocast(accelerator.device.type)
+
+    # 16. Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
     logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num batches each epoch = {train_dataloader.num_batches}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
@@ -1139,49 +1230,31 @@ def main(args):
         disable=not accelerator.is_local_main_process,
     )
 
-    unet.train()
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
                 # 1. Load and process the image and text conditioning
-                # pixel_values, text, orig_size, crop_coords = (
-                #     batch["pixel_values"],
-                #     batch["captions"],
-                #     batch["original_sizes"],
-                #     batch["crop_top_lefts"],
-                # )
-                latents, text, orig_size, crop_coords = (
-                    batch["cache_latents"],
-                    batch["captions"],
-                    batch["original_sizes"],
-                    batch["crop_top_lefts"],
-                )
-                
-                if not args.no_shuffle_tags:
-                    for i in range(len(text)):
-                        tags = [ x.strip() for x in text[i].split(',') ]
-                        keep_tags = tags[:args.activation_tags]
-                        shuffle_tags = tags[args.activation_tags:]
-                        random.shuffle(shuffle_tags)
-                        keep_tags.extend(shuffle_tags)
-                        text[i] = ", ".join(keep_tags)
+                image, text = batch
 
-                encoded_text = compute_embeddings_fn(text, orig_size, crop_coords)
+                image = image.to(accelerator.device, non_blocking=True)
+                encoded_text = compute_embeddings_fn(text)
+
+                pixel_values = image.to(dtype=weight_dtype)
+                if vae.dtype != weight_dtype:
+                    vae.to(dtype=weight_dtype)
 
                 # encode pixel values with batch size of at most args.vae_encode_batch_size
-                # pixel_values = pixel_values.to(dtype=vae.dtype)
-                # latents = []
-                # for i in range(0, pixel_values.shape[0], args.vae_encode_batch_size):
-                #     latents.append(vae.encode(pixel_values[i : i + args.vae_encode_batch_size]).latent_dist.sample())
-                # latents = torch.cat(latents, dim=0)
+                latents = []
+                for i in range(0, pixel_values.shape[0], args.vae_encode_batch_size):
+                    latents.append(vae.encode(pixel_values[i : i + args.vae_encode_batch_size]).latent_dist.sample())
+                latents = torch.cat(latents, dim=0)
 
-                # latents = latents * vae.config.scaling_factor
-                if args.pretrained_vae_model_name_or_path is None:
-                    latents = latents.to(weight_dtype)
+                latents = latents * vae.config.scaling_factor
+                latents = latents.to(weight_dtype)
+                bsz = latents.shape[0]
 
                 # 2. Sample a random timestep for each image t_n from the ODE solver timesteps without bias.
                 # For the DDIM solver, the timestep schedule is [T - 1, T - k - 1, T - 2 * k - 1, ...]
-                bsz = latents.shape[0]
                 topk = noise_scheduler.config.num_train_timesteps // args.num_ddim_timesteps
                 index = torch.randint(0, args.num_ddim_timesteps, (bsz,), device=latents.device).long()
                 start_timesteps = solver.ddim_timesteps[index]
@@ -1216,9 +1289,11 @@ def main(args):
                 noise_pred = unet(
                     noisy_model_input,
                     start_timesteps,
-                    encoder_hidden_states=prompt_embeds,
+                    timestep_cond=None,
+                    encoder_hidden_states=prompt_embeds.float(),
                     added_cond_kwargs=encoded_text,
                 ).sample
+
                 pred_x_0 = get_predicted_original_sample(
                     noise_pred,
                     start_timesteps,
@@ -1227,89 +1302,80 @@ def main(args):
                     alpha_schedule,
                     sigma_schedule,
                 )
+
                 model_pred = c_skip_start * noisy_model_input + c_out_start * pred_x_0
 
                 # 8. Compute the conditional and unconditional teacher model predictions to get CFG estimates of the
                 # predicted noise eps_0 and predicted original sample x_0, then run the ODE solver using these
                 # estimates to predict the data point in the augmented PF-ODE trajectory corresponding to the next ODE
                 # solver timestep.
-
-                # With the adapters disabled, the `unet` is the regular teacher model.
-                accelerator.unwrap_model(unet).disable_adapters()
                 with torch.no_grad():
-                    # 1. Get teacher model prediction on noisy_model_input z_{t_{n + k}} and conditional embedding c
-                    cond_teacher_output = unet(
-                        noisy_model_input,
-                        start_timesteps,
-                        encoder_hidden_states=prompt_embeds,
-                        added_cond_kwargs={k: v.to(weight_dtype) for k, v in encoded_text.items()},
-                    ).sample
-                    cond_pred_x0 = get_predicted_original_sample(
-                        cond_teacher_output,
-                        start_timesteps,
-                        noisy_model_input,
-                        noise_scheduler.config.prediction_type,
-                        alpha_schedule,
-                        sigma_schedule,
-                    )
-                    cond_pred_noise = get_predicted_noise(
-                        cond_teacher_output,
-                        start_timesteps,
-                        noisy_model_input,
-                        noise_scheduler.config.prediction_type,
-                        alpha_schedule,
-                        sigma_schedule,
-                    )
+                    with autocast_ctx:
+                        # 1. Get teacher model prediction on noisy_model_input z_{t_{n + k}} and conditional embedding c
+                        cond_teacher_output = teacher_unet(
+                            noisy_model_input.to(weight_dtype),
+                            start_timesteps,
+                            encoder_hidden_states=prompt_embeds.to(weight_dtype),
+                        ).sample
+                        cond_pred_x0 = get_predicted_original_sample(
+                            cond_teacher_output,
+                            start_timesteps,
+                            noisy_model_input,
+                            noise_scheduler.config.prediction_type,
+                            alpha_schedule,
+                            sigma_schedule,
+                        )
+                        cond_pred_noise = get_predicted_noise(
+                            cond_teacher_output,
+                            start_timesteps,
+                            noisy_model_input,
+                            noise_scheduler.config.prediction_type,
+                            alpha_schedule,
+                            sigma_schedule,
+                        )
 
-                    # 2. Get teacher model prediction on noisy_model_input z_{t_{n + k}} and unconditional embedding 0
-                    uncond_prompt_embeds = torch.zeros_like(prompt_embeds)
-                    uncond_pooled_prompt_embeds = torch.zeros_like(encoded_text["text_embeds"])
-                    uncond_added_conditions = copy.deepcopy(encoded_text)
-                    uncond_added_conditions["text_embeds"] = uncond_pooled_prompt_embeds
-                    uncond_teacher_output = unet(
-                        noisy_model_input,
-                        start_timesteps,
-                        encoder_hidden_states=uncond_prompt_embeds.to(weight_dtype),
-                        added_cond_kwargs={k: v.to(weight_dtype) for k, v in uncond_added_conditions.items()},
-                    ).sample
-                    uncond_pred_x0 = get_predicted_original_sample(
-                        uncond_teacher_output,
-                        start_timesteps,
-                        noisy_model_input,
-                        noise_scheduler.config.prediction_type,
-                        alpha_schedule,
-                        sigma_schedule,
-                    )
-                    uncond_pred_noise = get_predicted_noise(
-                        uncond_teacher_output,
-                        start_timesteps,
-                        noisy_model_input,
-                        noise_scheduler.config.prediction_type,
-                        alpha_schedule,
-                        sigma_schedule,
-                    )
+                        # 2. Get teacher model prediction on noisy_model_input z_{t_{n + k}} and unconditional embedding 0
+                        uncond_teacher_output = teacher_unet(
+                            noisy_model_input.to(weight_dtype),
+                            start_timesteps,
+                            encoder_hidden_states=uncond_prompt_embeds.to(weight_dtype),
+                        ).sample
+                        uncond_pred_x0 = get_predicted_original_sample(
+                            uncond_teacher_output,
+                            start_timesteps,
+                            noisy_model_input,
+                            noise_scheduler.config.prediction_type,
+                            alpha_schedule,
+                            sigma_schedule,
+                        )
+                        uncond_pred_noise = get_predicted_noise(
+                            uncond_teacher_output,
+                            start_timesteps,
+                            noisy_model_input,
+                            noise_scheduler.config.prediction_type,
+                            alpha_schedule,
+                            sigma_schedule,
+                        )
 
-                    # 3. Calculate the CFG estimate of x_0 (pred_x0) and eps_0 (pred_noise)
-                    # Note that this uses the LCM paper's CFG formulation rather than the Imagen CFG formulation
-                    pred_x0 = cond_pred_x0 + w * (cond_pred_x0 - uncond_pred_x0)
-                    pred_noise = cond_pred_noise + w * (cond_pred_noise - uncond_pred_noise)
-                    # 4. Run one step of the ODE solver to estimate the next point x_prev on the
-                    # augmented PF-ODE trajectory (solving backward in time)
-                    # Note that the DDIM step depends on both the predicted x_0 and source noise eps_0.
-                    x_prev = solver.ddim_step(pred_x0, pred_noise, index).to(accelerator.unwrap_model(unet).dtype)
-
-                # re-enable unet adapters to turn the `unet` into a student unet.
-                accelerator.unwrap_model(unet).enable_adapters()
+                        # 3. Calculate the CFG estimate of x_0 (pred_x0) and eps_0 (pred_noise)
+                        # Note that this uses the LCM paper's CFG formulation rather than the Imagen CFG formulation
+                        pred_x0 = cond_pred_x0 + w * (cond_pred_x0 - uncond_pred_x0)
+                        pred_noise = cond_pred_noise + w * (cond_pred_noise - uncond_pred_noise)
+                        # 4. Run one step of the ODE solver to estimate the next point x_prev on the
+                        # augmented PF-ODE trajectory (solving backward in time)
+                        # Note that the DDIM step depends on both the predicted x_0 and source noise eps_0.
+                        x_prev = solver.ddim_step(pred_x0, pred_noise, index)
 
                 # 9. Get target LCM prediction on x_prev, w, c, t_n (timesteps)
                 # Note that we do not use a separate target network for LCM-LoRA distillation.
                 with torch.no_grad():
-                    target_noise_pred = unet(
-                        x_prev,
-                        timesteps,
-                        encoder_hidden_states=prompt_embeds,
-                        added_cond_kwargs={k: v.to(weight_dtype) for k, v in encoded_text.items()},
-                    ).sample
+                    with autocast_ctx:
+                        target_noise_pred = unet(
+                            x_prev.float(),
+                            timesteps,
+                            timestep_cond=None,
+                            encoder_hidden_states=prompt_embeds.float(),
+                        ).sample
                     pred_x_0 = get_predicted_original_sample(
                         target_noise_pred,
                         timesteps,
@@ -1328,10 +1394,10 @@ def main(args):
                         torch.sqrt((model_pred.float() - target.float()) ** 2 + args.huber_c**2) - args.huber_c
                     )
 
-                # 11. Backpropagate on the online student model (`unet`) (only LoRA)
+                # 11. Backpropagate on the online student model (`unet`)
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(params_to_optimize, args.max_grad_norm)
+                    accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -1366,16 +1432,14 @@ def main(args):
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
-            
+
+                    if global_step % args.validation_steps == 0:
+                        log_validation(vae, unet, args, accelerator, weight_dtype, global_step)
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
-            # accelerator.print(f"loss:", logs["loss"], " lr:", logs["lr"])
 
-            if args.low_vram:
-                gc.collect()
-                torch.cuda.empty_cache()
             if global_step >= args.max_train_steps:
                 break
 
@@ -1383,8 +1447,9 @@ def main(args):
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         unet = accelerator.unwrap_model(unet)
-        unet_lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unet))
-        StableDiffusionXLPipeline.save_lora_weights(args.output_dir, unet_lora_layers=unet_lora_state_dict)
+        unet.save_pretrained(args.output_dir)
+        lora_state_dict = get_peft_model_state_dict(unet, adapter_name="default")
+        StableDiffusionPipeline.save_lora_weights(os.path.join(args.output_dir, "unet_lora"), lora_state_dict)
 
         if args.push_to_hub:
             upload_folder(
@@ -1394,10 +1459,8 @@ def main(args):
                 ignore_patterns=["step_*", "epoch_*"],
             )
 
-        del unet
-        torch.cuda.empty_cache()
-
     accelerator.end_training()
+
 
 if __name__ == "__main__":
     args = parse_args()
